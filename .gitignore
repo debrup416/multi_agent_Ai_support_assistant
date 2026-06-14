@@ -1,0 +1,13 @@
+# Secrets
+.env
+.env.langfuse
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# External data dumps (downloaded, not vendored) — see README "Database setup"
+db/pagila/*.sql

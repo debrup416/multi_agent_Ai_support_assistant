@@ -1,0 +1,66 @@
+[project]
+name = "multi-agent-ai-support-assistant"
+version = "0.1.0"
+description = "Multi-agent AI support assistant for a streaming + rental platform (take-home)"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.18.4",
+    "fastapi>=0.115",
+    "litellm>=1.83",
+    "mcp>=1.2",
+    "psycopg[binary]>=3.3.4",
+    "pydantic-settings>=2.4",
+    "python-dotenv>=1.2.2",
+    "sqlalchemy>=2.0.50",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+# A second agent runtime (Google ADK) that consumes the same tools over MCP. Kept
+# optional so the core service install stays lean — `uv sync --extra adk` pulls it in.
+# The `[extensions]` extra brings litellm (Claude via LiteLlm) pinned to its safe range.
+adk = [
+    "google-adk[extensions]>=2.2",
+]
+# Standard guardrail framework for the ADK layer (Guardrails AI). Separate from `adk`
+# because it is only needed for the guardrail plugin: `uv sync --extra adk --extra guardrails`.
+# Chosen because it co-installs with google-adk on Python 3.13 (shares its litellm range and
+# does not force torch/transformers) — unlike LLM Guard, whose pinned transformers/tokenizers
+# clash irreconcilably with google-adk's litellm.
+guardrails = [
+    "guardrails-ai>=0.10",
+]
+# A third agent runtime (Microsoft Semantic Kernel) that consumes the same tools over MCP.
+# Kept optional like `adk` — `uv sync --extra sk` pulls it in. No provider extra is needed:
+# the SK layer drives the LLM through a custom in-process connector over the base `litellm`
+# dep (sk_agents/pagila_support/llm.py), so there is no anthropic/openai SDK pin to clash.
+# Guardrails reuse the `guardrails` extra above.
+#
+# `adk` and `sk` CAN be installed together: SK >=1.43 allows `pydantic>=2.0,<2.14` and
+# google-adk needs `pydantic>=2.12,<3` — they overlap at pydantic 2.12/2.13. SK 1.43 pulls
+# `azure-ai-agents` (a pre-release); declaring it directly here lets uv select that pre-release
+# (uv won't auto-enable a pre-release for a transitive dep). Install both runtimes with:
+#   uv sync --extra adk --extra sk --extra guardrails
+sk = [
+    "semantic-kernel>=1.43.0",
+    "azure-ai-agents>=1.2.0b3",
+]
+# Self-hosted Langfuse observability (traces + token/cost). Kept optional like the
+# runtime extras — `uv sync --extra observability`. The Langfuse SDK is the only new
+# dependency: LiteLLM (a core dep) supplies the native "langfuse" success/failure
+# callback that auto-captures model/prompt/usage/cost for all three runtimes, and the
+# callback reuses this same `langfuse` package. Everything is gated behind
+# `langfuse_enabled` + keys, so the core install and default behavior are unchanged.
+observability = [
+    "langfuse>=4.7,<5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

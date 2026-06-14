@@ -1,0 +1,23 @@
+services:
+  db:
+    image: postgres:16
+    container_name: pagila-db
+    environment:
+      POSTGRES_DB: pagila
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Pagila schema + data auto-load on first init (empty volume), in filename order:
+      #   01-schema.sql then 02-data.sql. Re-restore: `docker compose down -v && docker compose up -d`.
+      - ./db/pagila:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pagila"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:
