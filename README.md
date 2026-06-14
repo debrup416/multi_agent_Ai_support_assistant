@@ -18,6 +18,14 @@ The agent reaches data **in-process** (`Agent → tools/ → service/`); the sam
 also exposed over HTTP (per-tool routes) and over MCP by the `pagila-support-mcp` server
 (`app/mcp/server.py`) — one source of truth, three transports.
 
+Three agent runtimes consume the same five tools over MCP:
+
+| Runtime | Entry point | Routing | Safety |
+|---|---|---|---|
+| **Core** (`app/`) | `POST /agent/respond` | Deterministic registry | Hand-rolled guardrails pipeline |
+| **Google ADK** (`adk_agents/`) | `POST /adk/respond` | LLM-driven (`transfer_to_agent`) | Optional Guardrails AI plugin |
+| **Semantic Kernel** (`sk_agents/`) | `POST /sk/respond` | LLM-driven (`HandoffOrchestration`) | Optional Guardrails AI plugin |
+
 ## Endpoints
 
 `POST /agent/respond` is the graded endpoint; the rest is a read-mostly **operator surface** for
@@ -26,6 +34,8 @@ inspecting and exercising the fixed system from Swagger (`/docs`).
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/agent/respond` | Full pipeline → `AgentResponse` (the stability contract) |
+| `POST` | `/adk/respond` | Google ADK runtime → leaner reply + sub-agent + MCP tools (requires `adk` extra) |
+| `POST` | `/sk/respond` | Semantic Kernel runtime → leaner reply + specialist + MCP tools (requires `sk` extra) |
 | `GET` | `/health` · `/ready` | Liveness; readiness (DB reachable + LLM configured) |
 | `GET` | `/agents` · `/agents/{name}` | The fixed agent registry and bound tools |
 | `GET` | `/routes` | Deterministic intent→agent table, threshold, fallback |
@@ -36,9 +46,6 @@ inspecting and exercising the fixed system from Swagger (`/docs`).
 | `GET` | `/handoffs` · `/handoffs/{id}` | Read the mock handoff sink (escalations) |
 | `GET` | `/evals` · `POST /evals/run` | List and run the eval suite (pass/fail + summary) |
 | `GET` | `/config` | Non-secret runtime config (never returns keys) |
-
-One optional endpoint, `POST /adk/respond`, is mounted only when the `adk` extra is installed — see
-[Google ADK agent layer](#google-adk-agent-layer-optional) below.
 
 ## Prerequisites
 
@@ -122,9 +129,9 @@ uv run python -m evals         # run the ≥10 eval cases through the real pipel
 
 Tests fake the LLM (deterministic, no network). The migration/service/tool tests assume the
 migrated Pagila DB from the setup steps is running. `POST /evals/run` runs the same suite via HTTP
-(uses the live LLM). The ADK and guardrail tests (`tests/test_adk_*.py`) are construction/plugin
-checks that **skip automatically** unless the `adk` / `guardrails` extras are installed — they need
-no live LLM either.
+(uses the live LLM). The ADK and SK guardrail tests (`tests/test_adk_*.py`, `tests/test_sk_*.py`)
+are construction/plugin checks that **skip automatically** unless the `adk` / `sk` / `guardrails`
+extras are installed — they need no live LLM either.
 
 ## MCP readiness
 
@@ -194,14 +201,86 @@ curl -s -X POST localhost:8000/adk/respond -H 'Content-Type: application/json' \
 
 The response is intentionally **leaner** than `/agent/respond`'s `AgentResponse` — `reply`, the
 specialist that answered, and the MCP tools it called — because the ADK path has no *deterministic*
-pipeline to back a `confidence`/`guardrail_result`. Routing is LLM-driven; safety is the agent
-instructions plus, with the `guardrails` extra, the Guardrails AI plugin above (injection blocked,
-cancel/refund/close escalated, leaks redacted). See [`docs/design.md`](docs/design.md) §7.1–7.2 and
-[`adk_agents/README.md`](adk_agents/README.md).
+pipeline to back a `confidence`/`guardrail_result`. See [`docs/design.md`](docs/design.md) §7.1–7.2
+and [`adk_agents/README.md`](adk_agents/README.md).
 
 > The ADK layer talks to the MCP server over streamable HTTP by default, so start it first — if it's
 > not reachable, `/adk/respond` returns a 503 telling you to. (On Windows, prefer HTTP over stdio:
 > `adk web` with stdio needs `--no-reload`.) Same trusted-`customer_id` model as above.
+
+## Semantic Kernel agent layer (optional)
+
+`sk_agents/` is a **third** agent runtime — a [Microsoft Semantic Kernel](https://learn.microsoft.com/en-us/semantic-kernel/overview/)
+multi-agent app that **consumes the same tools over MCP**. A tool-less triage agent hands off to one
+of five specialists via SK's `HandoffOrchestration`, each scoped to exactly one MCP tool. The only
+new LLM plumbing is a small SK↔LiteLLM connector, so every runtime drives the model through the same
+LiteLLM provider-resolution path.
+
+```bash
+uv sync --extra sk                                    # install semantic-kernel (kept out of the core install)
+uv sync --extra sk --extra guardrails                 # ...and the optional Guardrails AI guardrail plugin
+uv run python -m app.mcp.server --http --port 8765    # 1) start the MCP tools (needs the migrated Pagila DB)
+
+uv run python -m sk_agents.demo                       # 2) run sample messages end-to-end (live LLM)
+# or hit POST /sk/respond on the FastAPI app
+```
+
+**Key design points:**
+- SK has no built-in LiteLLM connector, so `sk_agents/pagila_support/llm.py` subclasses SK's
+  `ChatCompletionClientBase` and calls `litellm.acompletion(...)` in-process. Because LiteLLM speaks
+  OpenAI-shape, the connector reuses SK's `OpenAIChatPromptExecutionSettings` and the stock
+  function-calling callback. No provider extra is needed.
+- SK's MCP plugin has no `tool_filter`, unlike ADK's. So each specialist gets its own plugin instance,
+  connected and then pruned to its one owned tool — five live MCP sessions.
+- **Guardrails** (optional): same Guardrails AI posture as the ADK layer, wired differently. Input
+  screening and output redaction run as runner pre/post-steps (SK's function-invocation filter only
+  sees tool calls, not model text); the filter is used to capture which MCP tools were called.
+
+**Coexistence:** the `sk` and `adk` extras install together — `semantic-kernel>=1.43` allows
+`pydantic>=2.0,<2.14` and `google-adk` needs `pydantic>=2.12,<3`, overlapping at pydantic 2.12/2.13:
+
+```bash
+uv sync --extra adk --extra sk --extra guardrails     # both runtimes + guardrails; /adk/respond + /sk/respond both mount
+```
+
+```bash
+curl -s -X POST localhost:8000/sk/respond -H 'Content-Type: application/json' \
+  -d '{"customer_id":1,"conversation_id":"sk_001","message":"Is Alien available for streaming?"}'
+```
+
+The response shape mirrors the ADK path — `reply`, the responding specialist, and MCP tools called —
+with no faked `confidence`/`guardrail_result`. See [`docs/design.md`](docs/design.md) §7.3 and
+[`sk_agents/README.md`](sk_agents/README.md).
+
+> `/sk/respond` pre-flights the MCP server connection and returns a clear **503** if it's not
+> reachable. Same trusted-`customer_id` model as the other paths.
+
+## Observability (optional — Langfuse)
+
+Structured JSON logs (correlated by `conversation_id`) cover the full pipeline — routing decision,
+tool calls with latency, guardrail outcomes, and LLM token/cost. For a full UI over traces with
+token counts and cost per turn, enable the optional [Langfuse](https://langfuse.com) integration:
+
+```bash
+uv sync --extra observability             # install the Langfuse v4 SDK
+
+cp .env.langfuse.example .env.langfuse    # fill in the 3 secrets (openssl rand -hex 32)
+docker compose -f docker-compose.langfuse.yml --env-file .env.langfuse up -d  # 6-container stack on :3000
+```
+
+Then add to `.env`:
+
+```dotenv
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...   # from the Langfuse UI
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=http://localhost:3000   # or https://cloud.langfuse.com for Langfuse Cloud
+```
+
+The integration is off by default — with the `observability` extra absent, keys missing, or
+`LANGFUSE_ENABLED=false`, the tracing seam is a **no-op** and behavior is unchanged. The test suite
+always runs in this state. `langfuse_capture_io=false` suppresses raw prompt/tool text (sends only
+usage/cost/metadata). See [`docs/design.md`](docs/design.md) §9.1.
 
 ## Notes
 
